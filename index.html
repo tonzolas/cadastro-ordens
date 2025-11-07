@@ -1050,13 +1050,7 @@
             inicializarApp();
         });
 
-        async function inicializarApp() {
-    configurarEventos();
-    configurarEventosBackup(); // ← NOVA LINHA
-    await carregarDadosIniciais();
-    renderizarTabela();
-    atualizarStatusBackup(); // ← NOVA LINHA
-}
+        
 
         function configurarEventos() {
             console.log('Configurando eventos...');
@@ -1541,12 +1535,20 @@ function importarDados() {
 }
 
 // Processar arquivo importado
+// Processar arquivo importado - VERSÃO CORRIGIDA
 async function processarArquivoImportado(file) {
     return new Promise((resolve, reject) => {
+        // Verificar tamanho do arquivo (max 10MB)
+        if (file.size > 10 * 1024 * 1024) {
+            reject(new Error('Arquivo muito grande. Máximo 10MB.'));
+            return;
+        }
+        
         const reader = new FileReader();
         
         reader.onload = async function(e) {
             try {
+                console.log('Processando arquivo:', file.name, file.size, 'bytes');
                 const conteudo = e.target.result;
                 
                 if (file.name.endsWith('.json')) {
@@ -1554,7 +1556,7 @@ async function processarArquivoImportado(file) {
                 } else if (file.name.endsWith('.csv')) {
                     await importarCSV(conteudo);
                 } else {
-                    throw new Error('Formato de arquivo não suportado');
+                    throw new Error('Formato não suportado. Use .json ou .csv');
                 }
                 
                 resolve();
@@ -1563,53 +1565,98 @@ async function processarArquivoImportado(file) {
             }
         };
         
-        reader.onerror = () => reject(new Error('Erro ao ler arquivo'));
-        reader.readAsText(file);
+        reader.onerror = () => {
+            reject(new Error('Erro ao ler o arquivo. Tente novamente.'));
+        };
+        
+        reader.onabort = () => {
+            reject(new Error('Leitura do arquivo cancelada.'));
+        };
+        
+        try {
+            reader.readAsText(file, 'UTF-8');
+        } catch (error) {
+            reject(new Error('Não foi possível ler o arquivo.'));
+        }
     });
 }
 
 // Importar JSON
+// Importar JSON - VERSÃO CORRIGIDA
 async function importarJSON(conteudoJSON) {
     try {
+        console.log('Iniciando importação JSON...');
+        
         const dados = JSON.parse(conteudoJSON);
         
+        // Verificar estrutura do arquivo
         if (!dados.ordens || !Array.isArray(dados.ordens)) {
-            throw new Error('Arquivo JSON inválido');
+            // Tentar detectar se é array direto
+            if (Array.isArray(dados)) {
+                dados.ordens = dados; // Assume que é array direto de ordens
+            } else {
+                throw new Error('Arquivo JSON inválido: estrutura não reconhecida');
+            }
         }
+        
+        console.log(`Encontradas ${dados.ordens.length} ordens para importar`);
         
         const confirmacao = confirm(
             `Deseja importar ${dados.ordens.length} ordens?\n\n` +
-            `Isso irá ADICIONAR as novas ordens ao sistema atual.\n` +
-            `Ordens com números duplicados serão ignoradas.`
+            `⚠️  ATENÇÃO: Isso irá ADICIONAR as novas ordens ao sistema atual.\n` +
+            `📋 Ordens com números duplicados serão ignoradas.`
         );
         
-        if (!confirmacao) return;
+        if (!confirmacao) {
+            console.log('Importação cancelada pelo usuário');
+            return;
+        }
         
         let ordensImportadas = 0;
         let ordensDuplicadas = 0;
+        let ordensComErro = 0;
+        
+        // Mostrar loading
+        mostrarToast('Importando ordens...', 'sucesso');
         
         for (const ordem of dados.ordens) {
             try {
-                // Verificar se número da ordem já existe
-                if (ordem.numero_ordem && await numeroOrdemExiste(ordem.numero_ordem)) {
-                    ordensDuplicadas++;
+                // Validar dados mínimos
+                if (!ordem.endereco || !ordem.equipe) {
+                    console.warn('Ordem ignorada - dados insuficientes:', ordem);
+                    ordensComErro++;
                     continue;
                 }
                 
-                // Preparar dados para importação
+                // Verificar se número da ordem já existe (apenas se tiver número)
+                if (ordem.numero_ordem && ordem.numero_ordem.trim() !== '') {
+                    const existe = await numeroOrdemExiste(ordem.numero_ordem);
+                    if (existe) {
+                        console.log(`Ordem duplicada ignorada: ${ordem.numero_ordem}`);
+                        ordensDuplicadas++;
+                        continue;
+                    }
+                }
+                
+                // Preparar dados para importação - CORRIGIDO
                 const ordemImportada = {
-                    numero_ordem: ordem.numero_ordem || null,
-                    endereco: ordem.endereco,
-                    equipe: ordem.equipe,
-                    data_inicio: ordem.data_inicio,
+                    numero_ordem: ordem.numero_ordem || ordem.numeroOrdem || null,
+                    endereco: ordem.endereco || '',
+                    equipe: ordem.equipe || '',
+                    data_inicio: ordem.data_inicio || ordem.dataInicio || obterDataAtual(),
                     status: ordem.status || 'pendente'
                 };
                 
+                console.log('Salvando ordem:', ordemImportada);
                 await salvarOrdem(ordemImportada);
                 ordensImportadas++;
                 
+                // Pequena pausa para não sobrecarregar
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
             } catch (error) {
                 console.error('Erro ao importar ordem:', ordem, error);
+                ordensComErro++;
             }
         }
         
@@ -1617,13 +1664,29 @@ async function importarJSON(conteudoJSON) {
         await carregarDadosIniciais();
         renderizarTabela();
         
-        mostrarToast(
-            `Importação concluída: ${ordensImportadas} novas ordens, ${ordensDuplicadas} duplicadas ignoradas`
-        );
+        // Resultado detalhado
+        const mensagem = `
+✅ ${ordensImportadas} ordens importadas
+⚠️  ${ordensDuplicadas} duplicadas ignoradas
+❌ ${ordensComErro} com erro
+        `.trim();
+        
+        mostrarToast(mensagem);
+        
+        console.log(`Importação concluída: ${ordensImportadas} importadas, ${ordensDuplicadas} duplicadas, ${ordensComErro} erros`);
         
     } catch (error) {
         console.error('Erro ao importar JSON:', error);
-        mostrarToast('Erro ao importar arquivo JSON', 'erro');
+        
+        let mensagemErro = 'Erro ao importar arquivo JSON';
+        
+        if (error.message.includes('JSON')) {
+            mensagemErro = 'Arquivo JSON inválido ou corrompido';
+        } else if (error.message.includes('estrutura')) {
+            mensagemErro = 'Estrutura do arquivo não reconhecida';
+        }
+        
+        mostrarToast(`${mensagemErro}: ${error.message}`, 'erro');
     }
 }
 

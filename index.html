@@ -812,11 +812,23 @@
         </div>
         
         <div class="export-section">
-            <h3>Status do Sistema</h3>
-            <p id="statusConexao">Conectando ao banco de dados...</p>
-            <button class="btn-exportar" id="btnRecarregar">Recarregar Dados</button>
-        </div>
+    <h3>Backup e Restauração</h3>
+    <p id="statusConexao">Sistema conectado - {{ordens.length}} ordens carregadas</p>
+    
+    <div style="display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap;">
+        <button class="btn-exportar" id="btnExportarJSON">Exportar Backup (JSON)</button>
+        <button class="btn-exportar" id="btnExportarCSV">Exportar CSV</button>
+        <button class="btn-adicionar" id="btnImportar">Importar Backup</button>
+        <button class="btn-limpar-filtros" id="btnBackupAutomatico">Backup Automático</button>
     </div>
+    
+    <div style="margin-top: 15px; font-size: 12px; color: #666;">
+        <strong>Backup Automático:</strong> Último backup: <span id="ultimoBackup">Nunca</span>
+        <br><strong>Total de ordens:</strong> <span id="totalOrdens">0</span> ordens no sistema
+    </div>
+    
+    <input type="file" id="importFile" accept=".json,.csv" style="display: none;">
+</div>
 
     <!-- Modal para editar ordem -->
     <div class="modal" id="modalEditar">
@@ -1039,10 +1051,12 @@
         });
 
         async function inicializarApp() {
-            configurarEventos();
-            await carregarDadosIniciais();
-            renderizarTabela();
-        }
+    configurarEventos();
+    configurarEventosBackup(); // ← NOVA LINHA
+    await carregarDadosIniciais();
+    renderizarTabela();
+    atualizarStatusBackup(); // ← NOVA LINHA
+}
 
         function configurarEventos() {
             console.log('Configurando eventos...');
@@ -1443,6 +1457,364 @@
         }).catch(error => {
             console.error('Erro na conexão com Supabase:', error);
         });
+
+        // ========== SISTEMA DE BACKUP E EXPORT ==========
+
+// Exportar para JSON
+function exportarParaJSON() {
+    try {
+        const dadosExportacao = {
+            metadata: {
+                versao: "1.0",
+                dataExportacao: new Date().toISOString(),
+                totalOrdens: ordens.length,
+                sistema: "Controle de Ordens de Serviço"
+            },
+            ordens: ordens
+        };
+        
+        const dadosJSON = JSON.stringify(dadosExportacao, null, 2);
+        const blob = new Blob([dadosJSON], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `backup-ordens-${new Date().toISOString().split('T')[0]}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        // Salvar data do último backup
+        localStorage.setItem('ultimoBackup', new Date().toISOString());
+        atualizarStatusBackup();
+        
+        mostrarToast(`Backup exportado com ${ordens.length} ordens!`);
+    } catch (error) {
+        console.error('Erro ao exportar JSON:', error);
+        mostrarToast('Erro ao exportar backup', 'erro');
+    }
+}
+
+// Exportar para CSV
+function exportarParaCSV() {
+    try {
+        if (ordens.length === 0) {
+            mostrarToast('Nenhuma ordem para exportar', 'erro');
+            return;
+        }
+        
+        const cabecalhos = ['Número Ordem', 'Endereço', 'Equipe', 'Data Início', 'Status', 'ID', 'Data Criação'];
+        
+        const linhasCSV = ordens.map(ordem => [
+            `"${ordem.numero_ordem || ''}"`,
+            `"${ordem.endereco}"`,
+            `"${ordem.equipe}"`,
+            `"${ordem.data_inicio}"`,
+            `"${ordem.status}"`,
+            `"${ordem.id}"`,
+            `"${ordem.created_at}"`
+        ].join(','));
+        
+        const csvContent = [cabecalhos.join(','), ...linhasCSV].join('\n');
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `ordens-${new Date().toISOString().split('T')[0]}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        mostrarToast(`CSV exportado com ${ordens.length} ordens!`);
+    } catch (error) {
+        console.error('Erro ao exportar CSV:', error);
+        mostrarToast('Erro ao exportar CSV', 'erro');
+    }
+}
+
+// Importar dados
+function importarDados() {
+    document.getElementById('importFile').click();
+}
+
+// Processar arquivo importado
+async function processarArquivoImportado(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        
+        reader.onload = async function(e) {
+            try {
+                const conteudo = e.target.result;
+                
+                if (file.name.endsWith('.json')) {
+                    await importarJSON(conteudo);
+                } else if (file.name.endsWith('.csv')) {
+                    await importarCSV(conteudo);
+                } else {
+                    throw new Error('Formato de arquivo não suportado');
+                }
+                
+                resolve();
+            } catch (error) {
+                reject(error);
+            }
+        };
+        
+        reader.onerror = () => reject(new Error('Erro ao ler arquivo'));
+        reader.readAsText(file);
+    });
+}
+
+// Importar JSON
+async function importarJSON(conteudoJSON) {
+    try {
+        const dados = JSON.parse(conteudoJSON);
+        
+        if (!dados.ordens || !Array.isArray(dados.ordens)) {
+            throw new Error('Arquivo JSON inválido');
+        }
+        
+        const confirmacao = confirm(
+            `Deseja importar ${dados.ordens.length} ordens?\n\n` +
+            `Isso irá ADICIONAR as novas ordens ao sistema atual.\n` +
+            `Ordens com números duplicados serão ignoradas.`
+        );
+        
+        if (!confirmacao) return;
+        
+        let ordensImportadas = 0;
+        let ordensDuplicadas = 0;
+        
+        for (const ordem of dados.ordens) {
+            try {
+                // Verificar se número da ordem já existe
+                if (ordem.numero_ordem && await numeroOrdemExiste(ordem.numero_ordem)) {
+                    ordensDuplicadas++;
+                    continue;
+                }
+                
+                // Preparar dados para importação
+                const ordemImportada = {
+                    numero_ordem: ordem.numero_ordem || null,
+                    endereco: ordem.endereco,
+                    equipe: ordem.equipe,
+                    data_inicio: ordem.data_inicio,
+                    status: ordem.status || 'pendente'
+                };
+                
+                await salvarOrdem(ordemImportada);
+                ordensImportadas++;
+                
+            } catch (error) {
+                console.error('Erro ao importar ordem:', ordem, error);
+            }
+        }
+        
+        // Recarregar dados
+        await carregarDadosIniciais();
+        renderizarTabela();
+        
+        mostrarToast(
+            `Importação concluída: ${ordensImportadas} novas ordens, ${ordensDuplicadas} duplicadas ignoradas`
+        );
+        
+    } catch (error) {
+        console.error('Erro ao importar JSON:', error);
+        mostrarToast('Erro ao importar arquivo JSON', 'erro');
+    }
+}
+
+// Importar CSV (funcionalidade básica)
+async function importarCSV(conteudoCSV) {
+    try {
+        const linhas = conteudoCSV.split('\n').filter(linha => linha.trim());
+        const cabecalhos = linhas[0].split(',').map(h => h.replace(/"/g, '').trim());
+        
+        const ordensCSV = linhas.slice(1).map(linha => {
+            const valores = linha.split(',').map(v => v.replace(/"/g, '').trim());
+            const ordem = {};
+            
+            cabecalhos.forEach((cabecalho, index) => {
+                ordem[cabecalho] = valores[index] || '';
+            });
+            
+            return ordem;
+        });
+        
+        const confirmacao = confirm(
+            `Deseja importar ${ordensCSV.length} ordens do CSV?\n\n` +
+            `Certifique-se de que o CSV tenha as colunas: Número Ordem, Endereço, Equipe, Data Início, Status`
+        );
+        
+        if (!confirmacao) return;
+        
+        let ordensImportadas = 0;
+        
+        for (const ordem of ordensCSV) {
+            try {
+                if (!ordem.endereco || !ordem.equipe) continue;
+                
+                // Verificar duplicatas
+                if (ordem.numero_ordem && await numeroOrdemExiste(ordem.numero_ordem)) {
+                    continue;
+                }
+                
+                const ordemImportada = {
+                    numero_ordem: ordem.numero_ordem || ordem['Número Ordem'] || null,
+                    endereco: ordem.endereco || ordem.Endereço,
+                    equipe: ordem.equipe || ordem.Equipe,
+                    data_inicio: ordem.data_inicio || ordem['Data Início'] || obterDataAtual(),
+                    status: ordem.status || ordem.Status || 'pendente'
+                };
+                
+                await salvarOrdem(ordemImportada);
+                ordensImportadas++;
+                
+            } catch (error) {
+                console.error('Erro ao importar ordem do CSV:', ordem, error);
+            }
+        }
+        
+        await carregarDadosIniciais();
+        renderizarTabela();
+        
+        mostrarToast(`Importação CSV: ${ordensImportadas} ordens adicionadas`);
+        
+    } catch (error) {
+        console.error('Erro ao importar CSV:', error);
+        mostrarToast('Erro ao importar arquivo CSV', 'erro');
+    }
+}
+
+// Backup automático
+function fazerBackupAutomatico() {
+    try {
+        const dadosBackup = {
+            metadata: {
+                tipo: "backup_automatico",
+                data: new Date().toISOString(),
+                totalOrdens: ordens.length
+            },
+            ordens: ordens
+        };
+        
+        // Salvar no localStorage como backup local
+        localStorage.setItem('backupAutomatico', JSON.stringify(dadosBackup));
+        localStorage.setItem('ultimoBackup', new Date().toISOString());
+        
+        atualizarStatusBackup();
+        mostrarToast('Backup automático realizado com sucesso!');
+        
+    } catch (error) {
+        console.error('Erro no backup automático:', error);
+        mostrarToast('Erro no backup automático', 'erro');
+    }
+}
+
+// Restaurar backup automático
+async function restaurarBackupAutomatico() {
+    try {
+        const backupSalvo = localStorage.getItem('backupAutomatico');
+        if (!backupSalvo) {
+            mostrarToast('Nenhum backup local encontrado', 'erro');
+            return;
+        }
+        
+        const confirmacao = confirm(
+            'Deseja restaurar o último backup automático?\n\n' +
+            'Isso substituirá os dados atuais pelo backup.'
+        );
+        
+        if (!confirmacao) return;
+        
+        await importarJSON(backupSalvo);
+        
+    } catch (error) {
+        console.error('Erro ao restaurar backup:', error);
+        mostrarToast('Erro ao restaurar backup', 'erro');
+    }
+}
+
+// Atualizar status do backup
+function atualizarStatusBackup() {
+    const ultimoBackup = localStorage.getItem('ultimoBackup');
+    const elementoBackup = document.getElementById('ultimoBackup');
+    const totalOrdens = document.getElementById('totalOrdens');
+    
+    if (elementoBackup) {
+        if (ultimoBackup) {
+            const data = new Date(ultimoBackup);
+            elementoBackup.textContent = data.toLocaleString('pt-BR');
+        } else {
+            elementoBackup.textContent = 'Nunca';
+        }
+    }
+    
+    if (totalOrdens) {
+        totalOrdens.textContent = ordens.length;
+    }
+}
+
+// ========== CONFIGURAR EVENTOS DE BACKUP ==========
+
+function configurarEventosBackup() {
+    // Botão exportar JSON
+    const btnExportarJSON = document.getElementById('btnExportarJSON');
+    if (btnExportarJSON) {
+        btnExportarJSON.addEventListener('click', exportarParaJSON);
+    }
+    
+    // Botão exportar CSV
+    const btnExportarCSV = document.getElementById('btnExportarCSV');
+    if (btnExportarCSV) {
+        btnExportarCSV.addEventListener('click', exportarParaCSV);
+    }
+    
+    // Botão importar
+    const btnImportar = document.getElementById('btnImportar');
+    if (btnImportar) {
+        btnImportar.addEventListener('click', importarDados);
+    }
+    
+    // Botão backup automático
+    const btnBackupAutomatico = document.getElementById('btnBackupAutomatico');
+    if (btnBackupAutomatico) {
+        btnBackupAutomatico.addEventListener('click', fazerBackupAutomatico);
+    }
+    
+    // Input file para importação
+    const importFile = document.getElementById('importFile');
+    if (importFile) {
+        importFile.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                processarArquivoImportado(file)
+                    .then(() => {
+                        e.target.value = ''; // Limpar input
+                    })
+                    .catch(error => {
+                        console.error('Erro no processamento:', error);
+                        mostrarToast('Erro ao processar arquivo', 'erro');
+                        e.target.value = '';
+                    });
+            }
+        });
+    }
+}
+
+// ========== INICIALIZAR SISTEMA DE BACKUP ==========
+
+// Adicione esta linha na função inicializarApp():
+async function inicializarApp() {
+    configurarEventos();
+    configurarEventosBackup(); // ← ADICIONE ESTA LINHA
+    await carregarDadosIniciais();
+    renderizarTabela();
+    atualizarStatusBackup(); // ← E ESTA LINHA
+}
     </script>
 </body>
 </html>
